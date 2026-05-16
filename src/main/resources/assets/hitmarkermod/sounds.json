@@ -1,0 +1,18 @@
+{
+  "hit1": {
+    "category": "player",
+    "sounds": ["hitmarkermod:hit1"]
+  },
+  "hit2": {
+    "category": "player",
+    "sounds": ["hitmarkermod:hit2"]
+  },
+  "hit3": {
+    "category": "player",
+    "sounds": ["hitmarkermod:hit3"]
+  },
+  "kill": {
+    "category": "player",
+    "sounds": ["hitmarkermod:kill"]
+  }
+}
