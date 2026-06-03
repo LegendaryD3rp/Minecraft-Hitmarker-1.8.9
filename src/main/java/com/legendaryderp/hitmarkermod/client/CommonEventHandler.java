@@ -10,6 +10,8 @@ import net.minecraft.entity.projectile.EntityFishHook;
 import net.minecraftforge.event.entity.player.AttackEntityEvent;
 import net.minecraftforge.event.entity.player.ArrowLooseEvent;
 import net.minecraftforge.event.entity.EntityJoinWorldEvent;
+import net.minecraftforge.event.entity.living.LivingDeathEvent;
+import net.minecraftforge.event.entity.living.LivingHurtEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 import net.minecraftforge.fml.relauncher.Side;
@@ -21,13 +23,18 @@ import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 多人模式兼容的事件处理器。
+ * 命中检测事件处理器。
  *
- * 设计原则：不依赖 LivingHurtEvent / LivingDeathEvent（服务端事件，客户端不触发）。
- * 所有命中检测通过实体追踪 + 血量轮询实现。
+ * 分两层设计：
  *
- * 近战：    AttackEntityEvent(标识+音效+粒子) → ClientTickEvent血量轮询(伤害数字)
- * 弓箭/雪球/蛋/药水/末影珍珠：
+ * 单人模式（IntegratedServer）：
+ *   直接依赖 LivingHurtEvent——即时触发，覆盖所有伤害类型
+ *   （近战、弓箭、雪球、蛋、药水、鱼钩等），第一时间给出反馈。
+ *
+ * 多人模式（DedicatedServer）：
+ *   无法依赖 LivingHurtEvent（客户端不触发），改用实体追踪 + 血量轮询：
+ *   近战：    AttackEntityEvent(标识+音效+粒子) → ClientTickEvent血量轮询(伤害数字)
+ *   弓箭/雪球/蛋/药水/末影珍珠：
  *            EntityJoinWorldEvent 侦测抛射物 → ClientTickEvent追踪命中 →
  *            命中时记录附近实体血量 → 下一 tick 血量轮询(标识+音效+粒子+数字)
  */
@@ -166,6 +173,59 @@ public class CommonEventHandler {
             if (e.getDistanceToEntity(mc.thePlayer) < 3.0
                     && !trackedProjectiles.containsKey(e.getEntityId())) {
                 trackedProjectiles.put(e.getEntityId(), new TrackedProjectile(e));
+            }
+        }
+    }
+
+    /**
+     * 单人模式即时命中检测（LivingHurtEvent 在单人下可靠触发）。
+     *
+     * 覆盖所有伤害类型：
+     *   近战（剑/拳） → source.getEntity() == clientPlayer
+     *   弓箭 → source.getEntity() == clientPlayer（箭的 shooter 被转发到 source）
+     *   雪球/蛋/药水 → source.getEntity() == clientPlayer（同上）
+     *   鱼钩 → source.getEntity() == clientPlayer
+     *
+     * 多人下此事件不会在客户端触发，自动退回到 onClientTick 的血量轮询。
+     */
+    @SubscribeEvent
+    public void onLivingHurt(LivingHurtEvent event) {
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc.thePlayer == null) return;
+
+        // 只有单人模式才走 LivingHurt
+        if (!mc.isIntegratedServerRunning()) return;
+
+        // 检查是否是本玩家的伤害
+        if (event.source == null) return;
+        Entity trueSource = event.source.getEntity();
+        if (trueSource != mc.thePlayer) return;
+
+        Entity target = event.entity;
+        if (target == null || !target.isEntityAlive()) return;
+        if (target == mc.thePlayer) return; // 不标记自己受伤
+
+        int targetId = target.getEntityId();
+        if (!shouldTriggerHitMarker(targetId)) return;
+
+        entityHitTimestamps.put(targetId, System.currentTimeMillis());
+
+        // 命中标识 + 音效 + 粒子
+        HitMarkerRenderer.showHitMarker();
+        playRandomHitSound();
+        spawnHitParticles(targetId);
+
+        // 伤害数字
+        float damage = event.ammount;
+        if (damage > 0) {
+            HitMarkerRenderer.showDamageNumber(damage);
+        }
+
+        // 击杀检测：伤害后血量 <= 0
+        if (target instanceof EntityLivingBase) {
+            float healthAfter = ((EntityLivingBase) target).getHealth();
+            if (healthAfter <= 0.0F) {
+                HitMarkerRenderer.showKillMarker();
             }
         }
     }
