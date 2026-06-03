@@ -25,20 +25,29 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * 命中检测事件处理器。
  *
- * 分两层设计：
+ * 分三路检测（由简到繁）：
  *
- * 单人模式（IntegratedServer）：
- *   直接依赖 LivingHurtEvent——即时触发，覆盖所有伤害类型
- *   （近战、弓箭、雪球、蛋、药水、鱼钩等），第一时间给出反馈。
- *   注意：服务端实体（EntityPlayerMP）与客户端实体（EntityPlayerSP）
- *   不是同一实例，必须用 UUID 比较。
+ * ── 近战（单/多人通用） ──
+ *   AttackEntityEvent（客户端即时触发）
+ *   → 命中标识 + 音效 + 粒子 + 血量记录
+ *   → 下一 tick 血量轮询补伤害数字 + 击杀标识
  *
- * 多人模式（DedicatedServer）：
- *   无法依赖 LivingHurtEvent（客户端不触发），改用实体追踪 + 血量轮询：
- *   近战：    AttackEntityEvent(标识+音效+粒子) → ClientTickEvent血量轮询(伤害数字)
- *   弓箭/雪球/蛋/药水/末影珍珠：
- *            EntityJoinWorldEvent 侦测抛射物 → ClientTickEvent追踪命中 →
- *            命中时记录附近实体血量 → 下一 tick 血量轮询(标识+音效+粒子+数字)
+ * ── 远程抛射物（多人） ──
+ *   EntityJoinWorldEvent（客户端）侦测本玩家投出的抛射物
+ *   + ClientTickEvent 扫描（双保险）
+ *   → ClientTickEvent 追踪命中（抛射物消失/扎地）
+ *   → 命中的落点附近记录目标血量
+ *   → 下一 tick 血量轮询：标识 + 音效 + 粒子 + 数字 + 击杀
+ *
+ * ── 远程抛射物（单人） ──
+ *   EntityJoinWorldEvent（服务端线程）侦测本玩家投出的抛射物
+ *   注意：单人模式下服务端实体（EntityPlayerMP）与客户端实体
+ *   （EntityPlayerSP）非同一实例，必须用 UUID 比较
+ *   → 后续流程同多人（ClientTickEvent 追踪 + 血量轮询）
+ *
+ * ── 击杀标识 ──
+ *   单人：LivingDeathEvent（服务端线程）+ 血量轮询
+ *   多人：KillChatListener（解析聊天消息）+ 血量轮询
  */
 @SideOnly(Side.CLIENT)
 public class CommonEventHandler {
@@ -54,7 +63,7 @@ public class CommonEventHandler {
         float preHealth;
         long timestampMs;
         boolean damageShown;
-        boolean fromExplicitAttack; // true=近战(AttackEntityEvent), false=远程(抛射物追踪)
+        boolean fromExplicitAttack;
 
         HealthRecord(float preHealth, boolean fromExplicitAttack) {
             this.preHealth = preHealth;
@@ -67,12 +76,12 @@ public class CommonEventHandler {
     private final ConcurrentHashMap<Integer, HealthRecord> trackedHealth = new ConcurrentHashMap<>();
     private static final long HEALTH_TRACK_TIMEOUT_MS = 3000;
 
-    // ── 箭矢追踪（保留原有方式 + EntityJoinWorldEvent 增强） ──
+    // ── 箭矢追踪 ──
     private int trackedArrowId = -1;
     private long lastArrowShotTime = 0;
     private double lastArrowX, lastArrowY, lastArrowZ;
 
-    // ── 通用抛射物追踪（雪球、蛋、药水、末影珍珠、鱼钩等） ──
+    // ── 通用抛射物追踪 ──
     private static class TrackedProjectile {
         final int entityId;
         final long trackedSince;
@@ -95,8 +104,7 @@ public class CommonEventHandler {
     // ══════════════════════════════════════════════════════════════
 
     /**
-     * 近战攻击（多人可用）。
-     * 触发命中标识 + 音效 + 粒子 + 血量追踪(显式，仅产生伤害数字)。
+     * 近战攻击（单/多人通用）。
      */
     @SubscribeEvent
     public void onAttackEntity(AttackEntityEvent event) {
@@ -106,7 +114,6 @@ public class CommonEventHandler {
         int targetId = event.target.getEntityId();
         if (!shouldTriggerHitMarker(targetId)) return;
 
-        // 记录攻击前血量
         if (event.target instanceof EntityLivingBase) {
             trackedHealth.put(targetId,
                     new HealthRecord(((EntityLivingBase) event.target).getHealth(), true));
@@ -119,8 +126,7 @@ public class CommonEventHandler {
     }
 
     /**
-     * 弓箭射出（多人可用）。
-     * 仅标记需要追踪，实际箭矢寻找交给 EntityJoinWorldEvent + ClientTickEvent。
+     * 弓箭射出。
      */
     @SubscribeEvent
     public void onArrowLoose(ArrowLooseEvent event) {
@@ -131,14 +137,30 @@ public class CommonEventHandler {
     }
 
     /**
-     * 实体进入世界（多人可用）。
-     * 侦测本玩家发射的抛射物：箭矢、雪球、蛋、药水、末影珍珠、鱼钩。
+     * 实体进入世界。
+     *
+     * 侦测本玩家发射的抛射物。
+     *
+     * 单人模式下此事件仅在服务端线程触发（event.world.isRemote == false），
+     * 必须用 UUID 比较玩家身份。
      */
     @SubscribeEvent
     public void onEntityJoinWorld(EntityJoinWorldEvent event) {
-        if (event.entity == null || !event.world.isRemote) return;
+        if (event.entity == null) return;
+
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.thePlayer == null) return;
+
+        // ── 判断应处理服务端还是客户端的事件 ──
+        // 多人：只处理客户端事件（event.world.isRemote == true）
+        // 单人：只处理服务端事件（event.world.isRemote == false，客户端不会触发此事件）
+        boolean isSingleplayer = mc.isIntegratedServerRunning();
+        boolean isServerSide = !event.world.isRemote;
+        if (isSingleplayer) {
+            if (!isServerSide) return; // 单人模式只处理服务端事件
+        } else {
+            if (isServerSide) return;  // 多人模式只处理客户端事件
+        }
 
         Entity e = event.entity;
 
@@ -146,7 +168,7 @@ public class CommonEventHandler {
         if (e instanceof EntityArrow) {
             EntityArrow arrow = (EntityArrow) e;
             try {
-                if (arrow.shootingEntity == mc.thePlayer && trackedArrowId == -1) {
+                if (isMyArrow(arrow, mc) && trackedArrowId == -1) {
                     trackedArrowId = e.getEntityId();
                     lastArrowX = e.posX;
                     lastArrowY = e.posY;
@@ -160,18 +182,15 @@ public class CommonEventHandler {
         if (e instanceof EntityThrowable) {
             EntityThrowable th = (EntityThrowable) e;
             try {
-                EntityLivingBase thrower = th.getThrower();
-                if (thrower == mc.thePlayer && !trackedProjectiles.containsKey(e.getEntityId())) {
+                if (isMyThrowable(th, mc) && !trackedProjectiles.containsKey(e.getEntityId())) {
                     trackedProjectiles.put(e.getEntityId(), new TrackedProjectile(e));
                 }
             } catch (Exception ignored) {}
             return;
         }
 
-        // ── 鱼钩（EntityFishHook 不继承 EntityThrowable） ──
+        // ── 鱼钩 ──
         if (e instanceof EntityFishHook) {
-            // 1.8.9 多人中鱼钩的 angler 字段不通过 NBT 同步，
-            // 用距离判断：投出瞬间鱼钩在玩家附近
             if (e.getDistanceToEntity(mc.thePlayer) < 3.0
                     && !trackedProjectiles.containsKey(e.getEntityId())) {
                 trackedProjectiles.put(e.getEntityId(), new TrackedProjectile(e));
@@ -180,70 +199,24 @@ public class CommonEventHandler {
     }
 
     /**
-     * 单人模式即时命中检测（LivingHurtEvent 在单人下可靠触发）。
-     *
-     * 覆盖所有伤害类型（近战、弓箭、雪球、蛋、药水、鱼钩等）。
-     *
-     * ── 关键注意 ──
-     * 1. 单人集成服务器中，event.source 的实体是服务端对象
-     *    （EntityPlayerMP），mc.thePlayer 是客户端（EntityPlayerSP），
-     *    非同一实例，必须用 UUID 比较。
-     * 2. 抛射物必须用 getSourceOfDamage() 获取投掷者，
-     *    getEntity() 返回的是抛射物本身。
-     * 3. LivingHurtEvent 在伤害应用前触发，getHealth() 是伤害前血量，
-     *    需用 event.ammount 推算伤害后血量用于击杀检测。
-     *
-     * 多人下此事件不会在客户端触发，自动退回到 onClientTick 的血量轮询。
+     * 死亡事件（单人模式击杀检测）。
+     * 服务端线程触发，用于击杀标识 + 击杀音效 + 击杀粒子。
      */
     @SubscribeEvent
-    public void onLivingHurt(LivingHurtEvent event) {
+    public void onLivingDeath(LivingDeathEvent event) {
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.thePlayer == null) return;
-
-        // 只有单人模式才走 LivingHurt
-        if (!mc.isIntegratedServerRunning()) return;
-
-        // 检查是否是本玩家的伤害
+        if (!mc.isIntegratedServerRunning()) return; // 仅单人模式
         if (event.source == null) return;
 
-        // 用 getSourceOfDamage() 获取最终伤害来源：
-        //   近战 → 玩家本身
-        //   弓箭/雪球/蛋/药水 → 投掷者
-        Entity trueSource = event.source.getSourceOfDamage();
-        if (trueSource == null) return;
+        Entity killer = event.source.getSourceOfDamage();
+        if (killer == null) return;
+        if (!killer.getUniqueID().equals(mc.thePlayer.getUniqueID())) return;
 
-        // 单人模式下用 UUID 比较（服务端 vs 客户端实体不同实例）
-        if (!trueSource.getUniqueID().equals(mc.thePlayer.getUniqueID())) return;
+        triggerKillEffects();
 
-        Entity target = event.entity;
-        if (target == null || !target.isEntityAlive()) return;
-        if (target == mc.thePlayer || target.getUniqueID().equals(mc.thePlayer.getUniqueID())) return;
-
-        int targetId = target.getEntityId();
-        if (!shouldTriggerHitMarker(targetId)) return;
-
-        entityHitTimestamps.put(targetId, System.currentTimeMillis());
-
-        // 命中标识 + 音效 + 粒子
-        HitMarkerRenderer.showHitMarker();
-        playRandomHitSound();
-        spawnHitParticles(targetId);
-
-        // 伤害数字
-        float damage = event.ammount;
-        if (damage > 0) {
-            HitMarkerRenderer.showDamageNumber(damage);
-        }
-
-        // 击杀检测：LivingHurtEvent 在伤害应用前触发，
-        // 需用当前血量 - 伤害值 = 伤害后血量
-        if (target instanceof EntityLivingBase) {
-            EntityLivingBase living = (EntityLivingBase) target;
-            float healthAfter = living.getHealth() - event.ammount;
-            if (healthAfter <= 0.0F) {
-                HitMarkerRenderer.showKillMarker();
-            }
-        }
+        // 清除该实体的血量记录（已死，无需再轮询）
+        trackedHealth.remove(event.entity.getEntityId());
     }
 
     /**
@@ -266,9 +239,8 @@ public class CommonEventHandler {
             for (Entity e : mc.theWorld.loadedEntityList) {
                 if (e instanceof EntityArrow && !e.isDead
                         && e.getDistanceToEntity(mc.thePlayer) < 15.0) {
-                    EntityArrow arrow = (EntityArrow) e;
                     try {
-                        if (arrow.shootingEntity == mc.thePlayer) {
+                        if (isMyArrow((EntityArrow) e, mc)) {
                             trackedArrowId = e.getEntityId();
                             lastArrowX = e.posX;
                             lastArrowY = e.posY;
@@ -293,7 +265,6 @@ public class CommonEventHandler {
                 lastArrowX = arrow.posX;
                 lastArrowY = arrow.posY;
                 lastArrowZ = arrow.posZ;
-                // 扎地判定：飞行 500ms 后 motion 归零
                 if (now - lastArrowShotTime > 500
                         && Math.abs(arrow.motionX) < 0.001
                         && Math.abs(arrow.motionY) < 0.001
@@ -308,15 +279,12 @@ public class CommonEventHandler {
             Entity proj = mc.theWorld.getEntityByID(tp.entityId);
 
             if (proj == null || proj.isDead) {
-                // 抛射物消失 → 落点附近实体血量追踪（药水范围 4 格）
                 trackNearbyTargets(tp.lastX, tp.lastY, tp.lastZ, 4.0);
                 return true;
             }
-            // 超时清理（防止野指针累积）
             if (now - tp.trackedSince > PROJECTILE_TIMEOUT_MS) {
                 return true;
             }
-            // 更新位置
             tp.lastX = proj.posX;
             tp.lastY = proj.posY;
             tp.lastZ = proj.posZ;
@@ -340,16 +308,13 @@ public class CommonEventHandler {
                 if (damage >= 0.5f) {
                     record.damageShown = true;
                     if (record.fromExplicitAttack) {
-                        // 近战：标识/音效/粒子已在 AttackEntityEvent 触发，此处只补伤害数字
                         HitMarkerRenderer.showDamageNumber(damage);
                     } else {
-                        // 远程：首次触发完整命中反馈
                         HitMarkerRenderer.showHitMarker();
                         HitMarkerRenderer.showDamageNumber(damage);
                         playRandomHitSound();
                         spawnHitParticles(entry.getKey());
                     }
-                    // 击杀检测：血量 <= 0 触发击杀标识
                     if (curHealth <= 0.0F) {
                         HitMarkerRenderer.showKillMarker();
                     }
@@ -357,7 +322,6 @@ public class CommonEventHandler {
             }
         }
 
-        // 清理已处理或超时的记录
         trackedHealth.entrySet().removeIf(e -> e.getValue().damageShown);
     }
 
@@ -365,7 +329,27 @@ public class CommonEventHandler {
     //  辅助方法
     // ══════════════════════════════════════════════════════════════
 
-    /** 在指定位置附近记录实体当前血量（用于远程抛射物命中后的检测） */
+    /** 判断箭矢是否为本玩家射出（兼容单/多人，引用 + UUID 双保险） */
+    private boolean isMyArrow(EntityArrow arrow, Minecraft mc) {
+        if (arrow.shootingEntity == mc.thePlayer) return true;
+        if (arrow.shootingEntity != null && mc.thePlayer != null) {
+            return arrow.shootingEntity.getUniqueID().equals(mc.thePlayer.getUniqueID());
+        }
+        return false;
+    }
+
+    /** 判断抛射物是否为本玩家投出（兼容单/多人） */
+    private boolean isMyThrowable(EntityThrowable th, Minecraft mc) {
+        EntityLivingBase thrower = th.getThrower();
+        if (thrower == mc.thePlayer) return true;
+        if (thrower != null && mc.thePlayer != null) {
+            return thrower.getUniqueID().equals(mc.thePlayer.getUniqueID());
+        }
+        // 鱼钩等 thrower 可能为 null，用距离判断（已在调用处处理）
+        return false;
+    }
+
+    /** 在指定位置附近记录实体当前血量 */
     private void trackNearbyTargets(double x, double y, double z, double radius) {
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.theWorld == null) return;
@@ -380,7 +364,7 @@ public class CommonEventHandler {
         }
     }
 
-    /** 防刷：同一实体短时间内不重复触发 */
+    /** 防刷 */
     private boolean shouldTriggerHitMarker(int entityId) {
         Long lastHit = entityHitTimestamps.get(entityId);
         long now = System.currentTimeMillis();
@@ -431,8 +415,10 @@ public class CommonEventHandler {
         }
     }
 
-    /** 触发击杀效果 */
+    /** 触发击杀效果（标识 + 音效 + 粒子） */
     private void triggerKillEffects() {
+        HitMarkerRenderer.showKillMarker();
+
         if (HitMarkerMod.config.enableKillSound) {
             try {
                 Minecraft.getMinecraft().thePlayer.playSound(HitMarkerMod.KILL_SOUND,
@@ -448,10 +434,9 @@ public class CommonEventHandler {
                         net.minecraft.init.Blocks.redstone_block);
             }
         }
-        HitMarkerRenderer.showKillMarker();
     }
 
-    /** 击杀粒子（全屏红石爆破特效） */
+    /** 击杀粒子 */
     private void spawnBlockBreakParticlesAt(net.minecraft.world.World world,
                                              double x, double y, double z,
                                              net.minecraft.block.Block block) {
