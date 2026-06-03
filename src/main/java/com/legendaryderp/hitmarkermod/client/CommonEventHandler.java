@@ -30,6 +30,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * 单人模式（IntegratedServer）：
  *   直接依赖 LivingHurtEvent——即时触发，覆盖所有伤害类型
  *   （近战、弓箭、雪球、蛋、药水、鱼钩等），第一时间给出反馈。
+ *   注意：服务端实体（EntityPlayerMP）与客户端实体（EntityPlayerSP）
+ *   不是同一实例，必须用 UUID 比较。
  *
  * 多人模式（DedicatedServer）：
  *   无法依赖 LivingHurtEvent（客户端不触发），改用实体追踪 + 血量轮询：
@@ -180,11 +182,16 @@ public class CommonEventHandler {
     /**
      * 单人模式即时命中检测（LivingHurtEvent 在单人下可靠触发）。
      *
-     * 覆盖所有伤害类型：
-     *   近战（剑/拳） → source.getEntity() == clientPlayer
-     *   弓箭 → source.getEntity() == clientPlayer（箭的 shooter 被转发到 source）
-     *   雪球/蛋/药水 → source.getEntity() == clientPlayer（同上）
-     *   鱼钩 → source.getEntity() == clientPlayer
+     * 覆盖所有伤害类型（近战、弓箭、雪球、蛋、药水、鱼钩等）。
+     *
+     * ── 关键注意 ──
+     * 1. 单人集成服务器中，event.source 的实体是服务端对象
+     *    （EntityPlayerMP），mc.thePlayer 是客户端（EntityPlayerSP），
+     *    非同一实例，必须用 UUID 比较。
+     * 2. 抛射物必须用 getSourceOfDamage() 获取投掷者，
+     *    getEntity() 返回的是抛射物本身。
+     * 3. LivingHurtEvent 在伤害应用前触发，getHealth() 是伤害前血量，
+     *    需用 event.ammount 推算伤害后血量用于击杀检测。
      *
      * 多人下此事件不会在客户端触发，自动退回到 onClientTick 的血量轮询。
      */
@@ -198,12 +205,19 @@ public class CommonEventHandler {
 
         // 检查是否是本玩家的伤害
         if (event.source == null) return;
-        Entity trueSource = event.source.getEntity();
-        if (trueSource != mc.thePlayer) return;
+
+        // 用 getSourceOfDamage() 获取最终伤害来源：
+        //   近战 → 玩家本身
+        //   弓箭/雪球/蛋/药水 → 投掷者
+        Entity trueSource = event.source.getSourceOfDamage();
+        if (trueSource == null) return;
+
+        // 单人模式下用 UUID 比较（服务端 vs 客户端实体不同实例）
+        if (!trueSource.getUniqueID().equals(mc.thePlayer.getUniqueID())) return;
 
         Entity target = event.entity;
         if (target == null || !target.isEntityAlive()) return;
-        if (target == mc.thePlayer) return; // 不标记自己受伤
+        if (target == mc.thePlayer || target.getUniqueID().equals(mc.thePlayer.getUniqueID())) return;
 
         int targetId = target.getEntityId();
         if (!shouldTriggerHitMarker(targetId)) return;
@@ -221,9 +235,11 @@ public class CommonEventHandler {
             HitMarkerRenderer.showDamageNumber(damage);
         }
 
-        // 击杀检测：伤害后血量 <= 0
+        // 击杀检测：LivingHurtEvent 在伤害应用前触发，
+        // 需用当前血量 - 伤害值 = 伤害后血量
         if (target instanceof EntityLivingBase) {
-            float healthAfter = ((EntityLivingBase) target).getHealth();
+            EntityLivingBase living = (EntityLivingBase) target;
+            float healthAfter = living.getHealth() - event.ammount;
             if (healthAfter <= 0.0F) {
                 HitMarkerRenderer.showKillMarker();
             }
@@ -332,6 +348,10 @@ public class CommonEventHandler {
                         HitMarkerRenderer.showDamageNumber(damage);
                         playRandomHitSound();
                         spawnHitParticles(entry.getKey());
+                    }
+                    // 击杀检测：血量 <= 0 触发击杀标识
+                    if (curHealth <= 0.0F) {
+                        HitMarkerRenderer.showKillMarker();
                     }
                 }
             }
