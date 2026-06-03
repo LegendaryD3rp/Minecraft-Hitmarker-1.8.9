@@ -10,6 +10,7 @@ import net.minecraft.entity.projectile.EntityFishHook;
 import net.minecraftforge.event.entity.player.AttackEntityEvent;
 import net.minecraftforge.event.entity.player.ArrowLooseEvent;
 import net.minecraftforge.event.entity.EntityJoinWorldEvent;
+import net.minecraftforge.event.entity.living.LivingDeathEvent;
 import net.minecraftforge.event.entity.living.LivingHurtEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
@@ -20,31 +21,22 @@ import com.legendaryderp.hitmarkermod.client.HitMarkerRenderer;
 
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * 命中检测事件处理器。
  *
- * 架构（三种路径，确保单/多人全覆盖）：
+ * 架构概览：
  *
- *   ┌─ 路径一：近战（单/多人通用，客户端线程）
- *   │  AttackEntityEvent
- *   │    → 即时标识 + 音效 + 粒子 + 血量记录
- *   │    → ClientTick 血量轮询补伤害数字 + 击杀标识
- *   │
- *   ├─ 路径二：远程抛射物（多人，客户端线程）
- *   │  EntityJoinWorldEvent(客户端) + ClientTick 抛射物追踪
- *   │    → 命中时记录血量 → 下 tick 血量轮询
- *   │
- *   └─ 路径三：远程抛射物（单人，服务端线程 → volatile → 客户端线程）
- *      LivingHurtEvent(服务端)
- *        → volatile pendingSPHit/pendingSPDamage/pendingSPKill
- *        → ClientTick 消费标记 → 标识 + 数字 + 击杀 + 音效 + 粒子
- *      +
- *      EntityJoinWorldEvent(客户端+服务端双保险) 兜底
+ *   [近战] AttackEntityEvent(客户端) → 即时标识+音效+粒子 → 血量轮询补数字+击杀
+ *   [单人抛射物] LivingHurtEvent(服务端) → ConcurrentLinkedQueue → ClientTick 出队渲染
+ *   [多人抛射物] EntityJoinWorldEvent(客户端) → 追踪轨迹 → trackNearbyTargets → 血量轮询
+ *   [单人+多人兜底] ClientTick 血量轮询 → 伤害数字 + 击杀标识 + 击杀音效
+ *   [钓鱼竿] ClientTick 扫描 EntityFishHook.caughtEntity
+ *   [击杀] 单人: LivingDeathEvent → 入队 + 血量轮询兜底
+ *           多人: KillChatListener(聊天解析) + 血量轮询
  *
- * 击杀标识（全模式通用）：
- *   ClientTick 血量轮询 curHealth <= 0.0F → showKillMarker()
- *   原版方式，最可靠，唯一改动是修复了单人抛射物命中检测。
+ * 线程安全：服务端事件(单人)仅入 ConcurrentLinkedQueue，所有渲染均在客户端线程执行。
  */
 @SideOnly(Side.CLIENT)
 public class CommonEventHandler {
@@ -96,19 +88,27 @@ public class CommonEventHandler {
     private final ConcurrentHashMap<Integer, TrackedProjectile> trackedProjectiles = new ConcurrentHashMap<>();
     private static final long PROJECTILE_TIMEOUT_MS = 8000;
 
-    // ── 单人模式跨线程传递（volatile 标记） ──
-    private volatile boolean pendingSPHit = false;
-    private volatile float pendingSPDamage = 0F;
-    private volatile boolean pendingSPKill = false;
-    private volatile double pendingSPX = 0;
-    private volatile double pendingSPY = 0;
-    private volatile double pendingSPZ = 0;
+    // ── 钓鱼竿追踪 ──
+    private int trackedBobberId = -1;
+
+    // ── 单人模式跨线程传递队列 ──
+    private static class HitEntry {
+        final int entityId;
+        final float damage;
+        final double x, y, z;
+        final boolean isKill;
+        HitEntry(int id, float dmg, double px, double py, double pz, boolean kill) {
+            entityId = id; damage = dmg; x = px; y = py; z = pz; isKill = kill;
+        }
+    }
+
+    private final ConcurrentLinkedQueue<HitEntry> pendingSingleplayerHits = new ConcurrentLinkedQueue<>();
 
     // ══════════════════════════════════════════════════════════════
     //  事件处理器
     // ══════════════════════════════════════════════════════════════
 
-    // ────── 路径一：近战（单/多人通用） ──────
+    // ──── 近战（单/多人通用） ────
 
     @SubscribeEvent
     public void onAttackEntity(AttackEntityEvent event) {
@@ -129,7 +129,7 @@ public class CommonEventHandler {
         spawnHitParticles(targetId);
     }
 
-    // ────── 弓箭射出 ──────
+    // ──── 弓箭射出 ────
 
     @SubscribeEvent
     public void onArrowLoose(ArrowLooseEvent event) {
@@ -139,15 +139,8 @@ public class CommonEventHandler {
         trackedArrowId = -1;
     }
 
-    // ────── 路径二/三：抛射物进入世界 ──────
+    // ──── 抛射物进入世界（多人追踪 + 单人兜底） ────
 
-    /**
-     * 侦测本玩家发射的抛射物。
-     *
-     * 多人：仅在客户端线程触发（event.world.isRemote == true）
-     * 单人：服务端和客户端都会触发，两侧都接受（双保险）
-     *       实体 ID 服务端与客户端保持一致，ConcurrentHashMap 防重。
-     */
     @SubscribeEvent
     public void onEntityJoinWorld(EntityJoinWorldEvent event) {
         if (event.entity == null) return;
@@ -155,39 +148,34 @@ public class CommonEventHandler {
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.thePlayer == null) return;
 
-        // 多人：只处理客户端事件
-        // 单人：两侧都处理（服务端优先捕获，客户端做追踪更新）
+        // 多人只收客户端事件，单人两侧都收
         boolean isServerSide = !event.world.isRemote;
         if (!mc.isIntegratedServerRunning() && isServerSide) return;
 
         Entity e = event.entity;
 
-        // ── 箭矢 ──
+        // 箭矢
         if (e instanceof EntityArrow) {
             EntityArrow arrow = (EntityArrow) e;
             try {
-                if (arrow.shootingEntity == mc.thePlayer
-                        || (arrow.shootingEntity != null
-                            && arrow.shootingEntity.getUniqueID().equals(mc.thePlayer.getUniqueID()))) {
+                if (arrow.shootingEntity == mc.thePlayer || (arrow.shootingEntity != null
+                        && arrow.shootingEntity.getUniqueID().equals(mc.thePlayer.getUniqueID()))) {
                     if (trackedArrowId == -1) {
                         trackedArrowId = e.getEntityId();
-                        lastArrowX = e.posX;
-                        lastArrowY = e.posY;
-                        lastArrowZ = e.posZ;
+                        lastArrowX = e.posX; lastArrowY = e.posY; lastArrowZ = e.posZ;
                     }
                 }
             } catch (Exception ignored) {}
             return;
         }
 
-        // ── 雪球/蛋/药水等抛射物 ──
+        // 雪球/蛋/药水等
         if (e instanceof EntityThrowable) {
             EntityThrowable th = (EntityThrowable) e;
             try {
                 EntityLivingBase thrower = th.getThrower();
-                if (thrower == mc.thePlayer
-                        || (thrower != null
-                            && thrower.getUniqueID().equals(mc.thePlayer.getUniqueID()))) {
+                if (thrower == mc.thePlayer || (thrower != null
+                        && thrower.getUniqueID().equals(mc.thePlayer.getUniqueID()))) {
                     if (!trackedProjectiles.containsKey(e.getEntityId())) {
                         trackedProjectiles.put(e.getEntityId(), new TrackedProjectile(e));
                     }
@@ -196,32 +184,29 @@ public class CommonEventHandler {
             return;
         }
 
-        // ── 鱼钩 ──
+        // 鱼钩
         if (e instanceof EntityFishHook) {
-            if (e.getDistanceToEntity(mc.thePlayer) < 3.0
-                    && !trackedProjectiles.containsKey(e.getEntityId())) {
-                trackedProjectiles.put(e.getEntityId(), new TrackedProjectile(e));
+            EntityFishHook bobber = (EntityFishHook) e;
+            if (bobber.angler == mc.thePlayer) {
+                trackedBobberId = e.getEntityId();
+                if (!trackedProjectiles.containsKey(e.getEntityId())) {
+                    trackedProjectiles.put(e.getEntityId(), new TrackedProjectile(e));
+                }
             }
         }
     }
 
-    // ────── 路径三：单人抛射物命中（LivingHurtEvent） ──────
+    // ──── 单人抛射物命中（LivingHurtEvent） ────
 
-    /**
-     * 受击事件（单人模式核心命中检测）。
-     *
-     * 服务端线程触发。不直接调渲染 API，用 volatile 标记传递给客户端 tick。
-     * 覆盖：抛射物（雪球、弓箭、鱼竿、蛋、药水、末影珍珠）、近战兜底。
-     */
     @SubscribeEvent
     public void onLivingHurt(LivingHurtEvent event) {
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.thePlayer == null) return;
-        if (!mc.isIntegratedServerRunning()) return; // 仅单人模式
+        if (!mc.isIntegratedServerRunning()) return;
         if (event.entity == null || event.source == null) return;
 
-        // 找到攻击者：先试 getSourceOfDamage()（抛射物/间接伤害）
-        // 再试 getEntity()（直接近战伤害）
+        // 找攻击者：EntityDamageSourceIndirect.getSourceOfDamage() 返回 indirectEntity（抛射物的投掷者）
+        // EntityDamageSource.getEntity() 返回 damageSourceEntity（直接攻击者）
         Entity attacker = event.source.getSourceOfDamage();
         if (attacker == null) attacker = event.source.getEntity();
         if (attacker == null || !attacker.getUniqueID().equals(mc.thePlayer.getUniqueID())) return;
@@ -234,71 +219,108 @@ public class CommonEventHandler {
 
         entityHitTimestamps.put(targetId, System.currentTimeMillis());
 
-        // volatile 标记 → 下个客户端 tick 消费
-        pendingSPHit = true;
-        pendingSPDamage = event.ammount;
-        pendingSPKill = (((EntityLivingBase) event.entity).getHealth() - event.ammount) <= 0.0F;
-        pendingSPX = event.entity.posX;
-        pendingSPY = event.entity.posY + event.entity.height / 2.0;
-        pendingSPZ = event.entity.posZ;
+        float damage = event.ammount;
+        float hpAfter = ((EntityLivingBase) event.entity).getHealth() - damage;
+        boolean isKill = hpAfter <= 0.0F;
 
-        // 同时记录血量，供血量轮询补伤害数字/击杀标识（双保险）
+        // 入队 → onClientTick 出队渲染（线程安全）
+        pendingSingleplayerHits.add(new HitEntry(
+                targetId, damage,
+                event.entity.posX,
+                event.entity.posY + event.entity.height / 2.0,
+                event.entity.posZ,
+                isKill));
+
+        // 记录血量用于血量轮询兜底
         if (event.entity instanceof EntityLivingBase) {
             trackedHealth.put(targetId,
                     new HealthRecord(((EntityLivingBase) event.entity).getHealth(), false));
         }
     }
 
-    // ────── 客户端 tick 核心处理 ──────
+    // ──── 单人击杀（LivingDeathEvent） ────
+
+    @SubscribeEvent
+    public void onLivingDeath(LivingDeathEvent event) {
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc.thePlayer == null) return;
+        if (!mc.isIntegratedServerRunning()) return;
+        if (event.entity == null || event.source == null) return;
+
+        // 找攻击者（同 LivingHurtEvent 逻辑）
+        Entity attacker = event.source.getSourceOfDamage();
+        if (attacker == null) attacker = event.source.getEntity();
+        if (attacker == null || !attacker.getUniqueID().equals(mc.thePlayer.getUniqueID())) return;
+
+        // 入队击杀（血量轮询也会检测到，但增加了即时性）
+        pendingSingleplayerHits.add(new HitEntry(
+                event.entity.getEntityId(), 0F,
+                event.entity.posX,
+                event.entity.posY + event.entity.height / 2.0,
+                event.entity.posZ,
+                true));
+    }
+
+    // ──── 客户端 tick 核心处理 ────
 
     @SubscribeEvent
     public void onClientTick(TickEvent.ClientTickEvent event) {
         if (event.phase != TickEvent.Phase.END) return;
 
         Minecraft mc = Minecraft.getMinecraft();
-        if (mc.theWorld == null) {
-            trackedHealth.clear();
-            return;
-        }
+        if (mc.theWorld == null) { trackedHealth.clear(); return; }
 
         long now = System.currentTimeMillis();
 
-        // ────── 1. 消费单人模式 volatile 标记 ──────
-        if (pendingSPHit) {
-            pendingSPHit = false;
+        // ────── 1. 处理单人模式命中队列 ──────
+        HitEntry he;
+        while ((he = pendingSingleplayerHits.poll()) != null) {
             HitMarkerRenderer.showHitMarker();
-            if (pendingSPDamage > 0.5F) {
-                HitMarkerRenderer.showDamageNumber(pendingSPDamage);
+            if (he.damage > 0.5F) {
+                HitMarkerRenderer.showDamageNumber(he.damage);
             }
-            if (pendingSPKill) {
+            if (he.isKill) {
                 HitMarkerRenderer.showKillMarker();
+                playKillSound(mc);
             }
             playRandomHitSound();
-            spawnHitParticlesAt(pendingSPX, pendingSPY, pendingSPZ, 30,
-                    HitMarkerMod.config.hitBloodIntensity, false);
+            spawnHitParticlesAt(he.x, he.y, he.z, he.isKill ? 60 : 30,
+                    he.isKill ? HitMarkerMod.config.killBloodIntensity
+                              : HitMarkerMod.config.hitBloodIntensity);
+        }
 
-            if (pendingSPKill && HitMarkerMod.config.enableKillSound) {
-                try {
-                    mc.thePlayer.playSound(HitMarkerMod.KILL_SOUND,
-                            HitMarkerMod.config.soundVolume, 1.0F);
-                } catch (Exception ignored) {}
+        // ────── 2. 钓鱼竿 caughtEntity 检测 ──────
+        if (trackedBobberId != -1) {
+            Entity bobber = mc.theWorld.getEntityByID(trackedBobberId);
+            if (bobber instanceof EntityFishHook) {
+                EntityFishHook fh = (EntityFishHook) bobber;
+                if (fh.caughtEntity != null && fh.caughtEntity.isEntityAlive()) {
+                    Entity caught = fh.caughtEntity;
+                    int cid = caught.getEntityId();
+                    if (shouldTriggerHitMarker(cid)) {
+                        entityHitTimestamps.put(cid, now);
+                        HitMarkerRenderer.showHitMarker();
+                        playRandomHitSound();
+                        spawnHitParticlesAt(caught.posX, caught.posY + caught.height / 2.0,
+                                caught.posZ, 20, HitMarkerMod.config.hitBloodIntensity);
+                        trackedBobberId = -1; // 防重复
+                    }
+                }
+            } else {
+                trackedBobberId = -1;
             }
         }
 
-        // ────── 2. 箭矢追踪 ──────
+        // ────── 3. 箭矢追踪 ──────
         if (trackedArrowId == -1 && now - lastArrowShotTime < 2000) {
             for (Entity e : mc.theWorld.loadedEntityList) {
-                if (e instanceof EntityArrow && !e.isDead
-                        && e.getDistanceToEntity(mc.thePlayer) < 15.0) {
+                if (e instanceof EntityArrow && !e.isDead && e.getDistanceToEntity(mc.thePlayer) < 15.0) {
                     try {
                         EntityArrow arrow = (EntityArrow) e;
-                        if (arrow.shootingEntity == mc.thePlayer
-                                || (arrow.shootingEntity != null
-                                    && arrow.shootingEntity.getUniqueID().equals(mc.thePlayer.getUniqueID()))) {
+                        if (arrow.shootingEntity == mc.thePlayer || (arrow.shootingEntity != null
+                                && arrow.shootingEntity.getUniqueID().equals(mc.thePlayer.getUniqueID()))) {
                             trackedArrowId = e.getEntityId();
-                            lastArrowX = e.posX;
-                            lastArrowY = e.posY;
-                            lastArrowZ = e.posZ;
+                            lastArrowX = e.posX; lastArrowY = e.posY; lastArrowZ = e.posZ;
                             break;
                         }
                     } catch (Exception ignored) {}
@@ -315,9 +337,7 @@ public class CommonEventHandler {
                 trackNearbyTargets(ax, ay, az, 3.0);
                 trackedArrowId = -1;
             } else {
-                lastArrowX = arrow.posX;
-                lastArrowY = arrow.posY;
-                lastArrowZ = arrow.posZ;
+                lastArrowX = arrow.posX; lastArrowY = arrow.posY; lastArrowZ = arrow.posZ;
                 if (now - lastArrowShotTime > 500
                         && Math.abs(arrow.motionX) < 0.001
                         && Math.abs(arrow.motionY) < 0.001
@@ -327,7 +347,7 @@ public class CommonEventHandler {
             }
         }
 
-        // ────── 3. 通用抛射物追踪 ──────
+        // ────── 4. 通用抛射物追踪 ──────
         trackedProjectiles.values().removeIf(tp -> {
             Entity proj = mc.theWorld.getEntityByID(tp.entityId);
             if (proj == null || proj.isDead) {
@@ -335,19 +355,16 @@ public class CommonEventHandler {
                 return true;
             }
             if (now - tp.trackedSince > PROJECTILE_TIMEOUT_MS) return true;
-            tp.lastX = proj.posX;
-            tp.lastY = proj.posY;
-            tp.lastZ = proj.posZ;
+            tp.lastX = proj.posX; tp.lastY = proj.posY; tp.lastZ = proj.posZ;
             return false;
         });
 
-        // ────── 4. 血量轮询（伤害数字 + 击杀标识兜底） ──────
+        // ────── 5. 血量轮询（伤害数字 + 击杀标识兜底） ──────
         for (java.util.Map.Entry<Integer, HealthRecord> entry : trackedHealth.entrySet()) {
             HealthRecord record = entry.getValue();
             if (record.damageShown) continue;
             if (now - record.timestampMs > HEALTH_TRACK_TIMEOUT_MS) {
-                record.damageShown = true;
-                continue;
+                record.damageShown = true; continue;
             }
 
             Entity entity = mc.theWorld.getEntityByID(entry.getKey());
@@ -358,7 +375,7 @@ public class CommonEventHandler {
                     record.damageShown = true;
                     HitMarkerRenderer.showDamageNumber(damage);
                     // AttackEntityEvent/LivingHurtEvent 已触发标识+音效+粒子
-                    // 只有血量轮询的才补全套（抛射物追踪命中）
+                    // 血量轮询捕获的（抛射物追踪命中/兜底）补全套
                     if (!record.fromExplicitAttack) {
                         HitMarkerRenderer.showHitMarker();
                         playRandomHitSound();
@@ -366,6 +383,7 @@ public class CommonEventHandler {
                     }
                     if (curHealth <= 0.0F) {
                         HitMarkerRenderer.showKillMarker();
+                        playKillSound(mc);
                     }
                 }
             }
@@ -378,65 +396,59 @@ public class CommonEventHandler {
     //  辅助方法
     // ══════════════════════════════════════════════════════════════
 
-    /** 在指定位置附近搜索实体并记录血量 */
     private void trackNearbyTargets(double x, double y, double z, double radius) {
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.theWorld == null) return;
         net.minecraft.util.AxisAlignedBB box = net.minecraft.util.AxisAlignedBB.fromBounds(
-                x - radius, y - radius, z - radius,
-                x + radius, y + radius, z + radius);
+                x - radius, y - radius, z - radius, x + radius, y + radius, z + radius);
         for (EntityLivingBase target : mc.theWorld.getEntitiesWithinAABB(EntityLivingBase.class, box)) {
             if (target != mc.thePlayer && !trackedHealth.containsKey(target.getEntityId())) {
-                trackedHealth.put(target.getEntityId(),
-                        new HealthRecord(target.getHealth(), false));
+                trackedHealth.put(target.getEntityId(), new HealthRecord(target.getHealth(), false));
             }
         }
     }
 
-    /** 防刷 */
     private boolean shouldTriggerHitMarker(int entityId) {
         Long lastHit = entityHitTimestamps.get(entityId);
         long now = System.currentTimeMillis();
         return (lastHit == null) || (now - lastHit >= INVINCIBLE_FRAME);
     }
 
-    /** 判断是否为当前客户端玩家 */
     private boolean isClientPlayer(EntityPlayer player) {
         return player != null && player == Minecraft.getMinecraft().thePlayer;
     }
 
-    /** 播放随机命中音效 */
     private void playRandomHitSound() {
         try {
             if (!HitMarkerMod.config.enableHitSounds) return;
             String[] sounds = { HitMarkerMod.HIT1_SOUND, HitMarkerMod.HIT2_SOUND, HitMarkerMod.HIT3_SOUND };
             String sound = sounds[random.nextInt(sounds.length)];
-            Minecraft.getMinecraft().thePlayer.playSound(sound,
-                    HitMarkerMod.config.soundVolume, 1.0F);
+            Minecraft.getMinecraft().thePlayer.playSound(sound, HitMarkerMod.config.soundVolume, 1.0F);
         } catch (Exception ignored) {}
     }
 
-    /** 在指定坐标生成粒子 */
-    private void spawnHitParticlesAt(double x, double y, double z, int count, double intensity, boolean unused) {
+    private void playKillSound(Minecraft mc) {
+        try {
+            if (!HitMarkerMod.config.enableKillSound) return;
+            mc.thePlayer.playSound(HitMarkerMod.KILL_SOUND, HitMarkerMod.config.soundVolume, 1.0F);
+        } catch (Exception ignored) {}
+    }
+
+    private void spawnHitParticlesAt(double x, double y, double z, int count, double intensity) {
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.theWorld == null) return;
-
         for (int i = 0; i < count; i++) {
             double ox = (mc.theWorld.rand.nextDouble() - 0.5) * 1.2;
             double oy = (mc.theWorld.rand.nextDouble() - 0.5) * 1.2;
             double oz = (mc.theWorld.rand.nextDouble() - 0.5) * 1.2;
-            mc.theWorld.spawnParticle(
-                    net.minecraft.util.EnumParticleTypes.BLOCK_CRACK,
+            mc.theWorld.spawnParticle(net.minecraft.util.EnumParticleTypes.BLOCK_CRACK,
                     x + ox, y + oy, z + oz,
-                    ox * 0.15 * intensity,
-                    oy * 0.15 * intensity,
-                    oz * 0.15 * intensity,
+                    ox * 0.15 * intensity, oy * 0.15 * intensity, oz * 0.15 * intensity,
                     net.minecraft.block.Block.getStateId(
                             net.minecraft.init.Blocks.redstone_block.getDefaultState()));
         }
     }
 
-    /** 在目标位置生成命中粒子 */
     private void spawnHitParticles(int entityId) {
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.theWorld == null || !HitMarkerMod.config.enableHitBlood) return;
@@ -444,6 +456,6 @@ public class CommonEventHandler {
         if (!(target instanceof EntityLivingBase)) return;
         EntityLivingBase living = (EntityLivingBase) target;
         spawnHitParticlesAt(living.posX, living.posY + living.height / 2.0, living.posZ,
-                30, HitMarkerMod.config.hitBloodIntensity, false);
+                30, HitMarkerMod.config.hitBloodIntensity);
     }
 }
