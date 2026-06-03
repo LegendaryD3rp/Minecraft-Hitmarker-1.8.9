@@ -60,6 +60,10 @@ public class CommonEventHandler {
     // ── 钓鱼竿 ──
     private int bobberId = -1;
 
+    // ── 击杀音效防抖 ──
+    private long lastKillSoundTime = 0;
+    private static final long KILL_SOUND_COOLDOWN = 800;
+
     // ══════════════════════════════════════════════════════════════
     //  路一：近战（客户端线程，即时）
     // ══════════════════════════════════════════════════════════════
@@ -331,6 +335,9 @@ public class CommonEventHandler {
     private void playKillSound(Minecraft mc) {
         try {
             if (!HitMarkerMod.config.enableKillSound) return;
+            long now = System.currentTimeMillis();
+            if (now - lastKillSoundTime < KILL_SOUND_COOLDOWN) return;
+            lastKillSoundTime = now;
             mc.thePlayer.playSound(HitMarkerMod.KILL_SOUND,
                     HitMarkerMod.config.soundVolume, 1.0F);
         } catch (Exception ignored) {}
