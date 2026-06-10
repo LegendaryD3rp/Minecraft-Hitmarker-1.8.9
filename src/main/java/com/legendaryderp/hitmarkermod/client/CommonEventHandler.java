@@ -46,23 +46,34 @@ public class CommonEventHandler {
         final int entityId;
         double lastX, lastY, lastZ;
         long createdAt;
+        final boolean isZeroDamage; // 雪球/蛋/药水等（可能有伤害药水，但箭肯定有伤害）
         TrackedProjectile(Entity e) {
             this.entityId = e.getEntityId();
             this.lastX = e.posX; this.lastY = e.posY; this.lastZ = e.posZ;
             this.createdAt = System.currentTimeMillis();
+            this.isZeroDamage = e instanceof EntityThrowable && !(e instanceof EntityArrow);
         }
     }
     private final ConcurrentHashMap<Integer, TrackedProjectile> trackedProjectiles = new ConcurrentHashMap<>();
     private static final long PROJ_TIMEOUT = 10000;
 
-    // ── 定点血量轮询（只追踪被标记过的实体） ──
+    // ── 定点血量轮询（只追踪被抛射物标记过的实体） ──
     private static class HealthWatch {
         float lastHealth;
-        long lastUpdated;
-        HealthWatch(float h) { this.lastHealth = h; this.lastUpdated = System.currentTimeMillis(); }
+        long flaggedAt;     // 被标记的时间（抛射物消失于附近）
+        long updatedAt;     // 上次健康检查时间
+        boolean hitTriggered; // 本次标记周期是否已触发过
+        HealthWatch(float h) {
+            this.lastHealth = h;
+            long now = System.currentTimeMillis();
+            this.flaggedAt = now;
+            this.updatedAt = now;
+            this.hitTriggered = false;
+        }
     }
     private final ConcurrentHashMap<Integer, HealthWatch> watchedHealth = new ConcurrentHashMap<>();
     private static final long WATCH_TIMEOUT = 4000;
+    private static final long CONFIDENCE_WINDOW = 300; // 被标记后300ms内的掉血才算可信
 
     // ── 钓鱼竿 ──
     private int bobberId = -1;
@@ -196,7 +207,7 @@ public class CommonEventHandler {
         trackedProjectiles.values().removeIf(tp -> {
             Entity proj = mc.theWorld.getEntityByID(tp.entityId);
             if (proj == null || proj.isDead) {
-                flagNearbyEntities(tp.lastX, tp.lastY, tp.lastZ, 4.0);
+                flagNearbyEntities(tp.lastX, tp.lastY, tp.lastZ, 4.0, tp.isZeroDamage);
                 return true;
             }
             if (now - tp.createdAt > PROJ_TIMEOUT) return true;
@@ -229,7 +240,7 @@ public class CommonEventHandler {
         // ── 定点血量轮询（只查被标记过的实体） ──
         for (java.util.Map.Entry<Integer, HealthWatch> entry : watchedHealth.entrySet()) {
             HealthWatch watch = entry.getValue();
-            if (now - watch.lastUpdated > WATCH_TIMEOUT) continue;
+            if (now - watch.updatedAt > WATCH_TIMEOUT) continue;
 
             Entity entity = mc.theWorld.getEntityByID(entry.getKey());
             if (!(entity instanceof EntityLivingBase) || entity.isDead) continue;
@@ -238,27 +249,47 @@ public class CommonEventHandler {
             float curHealth = living.getHealth();
             float diff = watch.lastHealth - curHealth;
 
-            if (diff >= 0.5f) {
-                if (shouldTriggerHitMarker(entry.getKey())) {
-                    entityHitTimestamps.put(entry.getKey(), now);
-                    HitMarkerRenderer.showHitMarker();
-                    HitMarkerRenderer.showDamageNumber(diff);
-                    playRandomHitSound();
-                    spawnHitParticlesAt(living.posX, living.posY + living.height / 2.0,
-                            living.posZ, 25, HitMarkerMod.config.hitBloodIntensity);
-                }
-                if (curHealth <= 0.0F) {
-                    HitMarkerRenderer.showKillMarker();
-                    playKillSound();
-                }
+            // 本轮已触发过 → 只更新血量，不触发
+            if (watch.hitTriggered) {
+                watch.lastHealth = curHealth;
+                watch.updatedAt = now;
+                continue;
             }
+
+            long timeSinceFlag = now - watch.flaggedAt;
+
+            if (diff >= 0.5f) {
+                // 甄别：只有被标记后 CONFIDENCE_WINDOW 内的掉血才认作命中
+                if (timeSinceFlag <= CONFIDENCE_WINDOW) {
+                    if (shouldTriggerHitMarker(entry.getKey())) {
+                        entityHitTimestamps.put(entry.getKey(), now);
+                        HitMarkerRenderer.showHitMarker();
+                        HitMarkerRenderer.showDamageNumber(diff);
+                        playRandomHitSound();
+                        spawnHitParticlesAt(living.posX, living.posY + living.height / 2.0,
+                                living.posZ, 25, HitMarkerMod.config.hitBloodIntensity);
+                    }
+                    if (curHealth <= 0.0F) {
+                        HitMarkerRenderer.showKillMarker();
+                        playKillSound();
+                    }
+                }
+                // 不管认不认，标记已触发，避免重复检查
+                watch.hitTriggered = true;
+            }
+
+            // 超时窗口关闭 → 标记已触发
+            if (timeSinceFlag > CONFIDENCE_WINDOW) {
+                watch.hitTriggered = true;
+            }
+
             watch.lastHealth = curHealth;
-            watch.lastUpdated = now;
+            watch.updatedAt = now;
         }
 
         // 清理超时/死亡
         watchedHealth.entrySet().removeIf(e -> {
-            if (now - e.getValue().lastUpdated > WATCH_TIMEOUT) return true;
+            if (now - e.getValue().updatedAt > WATCH_TIMEOUT) return true;
             Entity ent = mc.theWorld.getEntityByID(e.getKey());
             return ent == null || ent.isDead;
         });
@@ -268,8 +299,8 @@ public class CommonEventHandler {
     //  辅助
     // ══════════════════════════════════════════════════════════════
 
-    /** 抛射物消失点附近实体加入血量监控（不触发标识） */
-    private void flagNearbyEntities(double x, double y, double z, double radius) {
+    /** 抛射物消失点附近实体加入血量监控 */
+    private void flagNearbyEntities(double x, double y, double z, double radius, boolean isZeroDamage) {
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.theWorld == null) return;
         net.minecraft.util.AxisAlignedBB box = net.minecraft.util.AxisAlignedBB.fromBounds(
@@ -277,8 +308,29 @@ public class CommonEventHandler {
         for (EntityLivingBase target : mc.theWorld.getEntitiesWithinAABB(EntityLivingBase.class, box)) {
             if (target == mc.thePlayer) continue;
             int tid = target.getEntityId();
-            if (!watchedHealth.containsKey(tid)) {
+            double dist = target.getDistance(x, y, z);
+
+            // 无伤害抛射物（雪球/蛋）：消失时离实体 ≤ 1.5 格 → 直接当命中
+            if (isZeroDamage && dist <= 1.5 && shouldTriggerHitMarker(tid)) {
+                entityHitTimestamps.put(tid, System.currentTimeMillis());
+                HitMarkerRenderer.showHitMarker();
+                playRandomHitSound();
+                spawnHitParticlesAt(target.posX,
+                        target.posY + target.height / 2.0,
+                        target.posZ,
+                        20, HitMarkerMod.config.hitBloodIntensity);
+            }
+
+            // 加入血量监控（有伤害抛射物后续血量轮询检测）
+            HealthWatch existing = watchedHealth.get(tid);
+            if (existing == null) {
                 watchedHealth.put(tid, new HealthWatch(target.getHealth()));
+            } else {
+                long now = System.currentTimeMillis();
+                existing.flaggedAt = now;
+                existing.updatedAt = now;
+                existing.hitTriggered = false;
+                existing.lastHealth = target.getHealth();
             }
         }
     }
