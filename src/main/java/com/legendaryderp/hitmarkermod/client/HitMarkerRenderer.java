@@ -122,9 +122,11 @@ public class HitMarkerRenderer {
         GlStateManager.disableTexture2D();
         GlStateManager.enableBlend();
         GlStateManager.blendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        GlStateManager.color(r, g, b, alpha);
+
+        // GL_LINE_SMOOTH / glLineWidth 无 GlStateManager 包装，手动 save/restore
         GL11.glEnable(GL11.GL_LINE_SMOOTH);
         GL11.glHint(GL11.GL_LINE_SMOOTH_HINT, GL11.GL_NICEST);
-        GlStateManager.color(r, g, b, alpha);
         GL11.glLineWidth(thickness);
 
         float d = 0.7071f;
@@ -133,11 +135,12 @@ public class HitMarkerRenderer {
         drawLine(cx, cy, -d, d, gap, lineLen, taper, translateDist);
         drawLine(cx, cy, -d, -d, gap, lineLen, taper, translateDist);
 
-        // 恢复 GL 状态
+        // 恢复 GL 状态（含 raw GL 调用）
+        GL11.glLineWidth(1.0f);
+        GL11.glDisable(GL11.GL_LINE_SMOOTH);
         GlStateManager.enableTexture2D();
         GlStateManager.disableBlend();
         GlStateManager.color(1.0F, 1.0F, 1.0F, 1.0F);
-        GL11.glDisable(GL11.GL_LINE_SMOOTH);
     }
 
     private void drawLine(float cx, float cy, float dx, float dy, float gap, float len, float taper, float trans) {
