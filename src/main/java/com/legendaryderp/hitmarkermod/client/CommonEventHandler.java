@@ -7,6 +7,9 @@ import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.entity.projectile.EntityArrow;
 import net.minecraft.entity.projectile.EntityThrowable;
 import net.minecraft.entity.projectile.EntityFishHook;
+import net.minecraft.util.DamageSource;
+import net.minecraftforge.event.entity.living.LivingDeathEvent;
+import net.minecraftforge.event.entity.living.LivingHurtEvent;
 import net.minecraftforge.event.entity.player.AttackEntityEvent;
 import net.minecraftforge.event.entity.player.ArrowLooseEvent;
 import net.minecraftforge.event.entity.EntityJoinWorldEvent;
@@ -23,8 +26,9 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * 多人模式兼容的事件处理器。
  *
- * 设计原则：不依赖 LivingHurtEvent / LivingDeathEvent（服务端事件，客户端不触发）。
- * 所有命中检测通过实体追踪 + 血量轮询实现。
+ * 命中检测策略：
+ * - 多人模式：AttackEntityEvent(近战) + 抛射物追踪 + 血量轮询
+ * - 单人模式：LivingHurtEvent(命中) + LivingDeathEvent(击杀)
  *
  * 近战：    AttackEntityEvent(标识+音效+粒子) → ClientTickEvent血量轮询(伤害数字)
  * 弓箭/雪球/蛋/药水/末影珍珠：
@@ -120,6 +124,52 @@ public class CommonEventHandler {
         lastArrowShotTime = System.currentTimeMillis();
         trackedArrowId = -1;
     }
+
+    // ════════════════════════════════════════════
+    //  单人模式：LivingHurtEvent / LivingDeathEvent
+    // ════════════════════════════════════════════
+
+    @SubscribeEvent
+    public void onLivingHurt(LivingHurtEvent event) {
+        if (event.entity == null || event.source == null || !event.entity.isEntityAlive()) return;
+
+        EntityPlayer attacker = getAttackerFromDamageSource(event.source);
+        if (attacker == null || !isClientPlayer(attacker)) return;
+
+        if (shouldTriggerHitMarker(event.entity.getEntityId())) {
+            triggerHitEffects(event.entity.getEntityId(), event.entity.getName(), event.ammount);
+        }
+    }
+
+    @SubscribeEvent
+    public void onLivingDeath(LivingDeathEvent event) {
+        if (event.entity == null || event.source == null) return;
+
+        EntityPlayer killer = getAttackerFromDamageSource(event.source);
+        if (killer != null && isClientPlayerLoose(killer)) {
+            triggerKillEffects();
+        }
+        entityHitTimestamps.remove(event.entity.getEntityId());
+    }
+
+    private void triggerHitEffects(int entityId, String targetName, float damage) {
+        entityHitTimestamps.put(entityId, System.currentTimeMillis());
+
+        try {
+            HitMarkerRenderer.showHitMarker();
+            playRandomHitSound();
+            spawnHitParticles(entityId);
+            if (damage > 0) {
+                HitMarkerRenderer.showDamageNumber(damage);
+            }
+        } catch (Exception e) {
+            HitMarkerMod.logger.error("[HIT] Hit effects failed: {}", e.getMessage());
+        }
+    }
+
+    // ────────────────────────────────────────────
+    //  抛射物追踪
+    // ────────────────────────────────────────────
 
     /**
      * 实体进入世界（多人可用）。
@@ -310,6 +360,43 @@ public class CommonEventHandler {
     /** 判断是否为当前客户端玩家 */
     private boolean isClientPlayer(EntityPlayer player) {
         return player != null && player == Minecraft.getMinecraft().thePlayer;
+    }
+
+    /** 宽松的玩家身份验证（多人模式优化） */
+    private boolean isClientPlayerLoose(EntityPlayer player) {
+        if (player == null) return false;
+        try {
+            EntityPlayer clientPlayer = Minecraft.getMinecraft().thePlayer;
+            return player.equals(clientPlayer) ||
+                    (player.getName() != null && player.getName().equals(clientPlayer.getName()));
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    /** 从伤害源提取攻击者玩家 */
+    private EntityPlayer getAttackerFromDamageSource(DamageSource source) {
+        if (source == null) return null;
+        try {
+            if (source.getEntity() instanceof EntityPlayer) {
+                return (EntityPlayer) source.getEntity();
+            }
+            if (source.getEntity() instanceof EntityArrow) {
+                EntityArrow arrow = (EntityArrow) source.getEntity();
+                if (arrow.shootingEntity instanceof EntityPlayer) {
+                    return (EntityPlayer) arrow.shootingEntity;
+                }
+            }
+            if (source.getEntity() instanceof EntityThrowable) {
+                EntityThrowable throwable = (EntityThrowable) source.getEntity();
+                if (throwable.getThrower() instanceof EntityPlayer) {
+                    return (EntityPlayer) throwable.getThrower();
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /** 播放随机命中音效 */
