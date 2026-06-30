@@ -34,6 +34,16 @@ public class HitMarkerConfig {
     public int killColorB = 0;
     public float killSize = 12.0f;
 
+    // ── border ──
+    public boolean enableBorder = false;
+    public float borderWidth = 1.5f;
+    public int borderColorR = 0;
+    public int borderColorG = 0;
+    public int borderColorB = 0;
+    public int killBorderColorR = 0;
+    public int killBorderColorG = 0;
+    public int killBorderColorB = 0;
+
     // ── effects ──
     public boolean enableHitBlood = true;
     public float hitBloodIntensity = 0.3f;
@@ -147,6 +157,46 @@ public class HitMarkerConfig {
         p.comment = "Size of the kill marker lines in GUI pixels";
         p.setMinValue(2.0).setMaxValue(48.0);
         killSize = (float) p.getDouble();
+
+        // ── border ──
+        p = config.get("border", "enableBorder", false);
+        p.comment = "Enable border/outline around hit markers";
+        enableBorder = p.getBoolean();
+
+        p = config.get("border", "borderWidth", 1.5);
+        p.comment = "Border thickness in pixels";
+        p.setMinValue(0.0).setMaxValue(10.0);
+        borderWidth = (float) p.getDouble();
+
+        p = config.get("border", "borderColorR", 0);
+        p.comment = "Border color - Red (0-255)";
+        p.setMinValue(0).setMaxValue(255);
+        borderColorR = p.getInt();
+
+        p = config.get("border", "borderColorG", 0);
+        p.comment = "Border color - Green (0-255)";
+        p.setMinValue(0).setMaxValue(255);
+        borderColorG = p.getInt();
+
+        p = config.get("border", "borderColorB", 0);
+        p.comment = "Border color - Blue (0-255)";
+        p.setMinValue(0).setMaxValue(255);
+        borderColorB = p.getInt();
+
+        p = config.get("border", "killBorderColorR", 0);
+        p.comment = "Kill border color - Red (0-255)";
+        p.setMinValue(0).setMaxValue(255);
+        killBorderColorR = p.getInt();
+
+        p = config.get("border", "killBorderColorG", 0);
+        p.comment = "Kill border color - Green (0-255)";
+        p.setMinValue(0).setMaxValue(255);
+        killBorderColorG = p.getInt();
+
+        p = config.get("border", "killBorderColorB", 0);
+        p.comment = "Kill border color - Blue (0-255)";
+        p.setMinValue(0).setMaxValue(255);
+        killBorderColorB = p.getInt();
 
         // ── effects ──
         p = config.get("effects", "enableHitBlood", true);
