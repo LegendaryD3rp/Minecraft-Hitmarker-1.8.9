@@ -63,6 +63,9 @@ public class HitMarkerRenderer {
         if (event.type == RenderGameOverlayEvent.ElementType.CROSSHAIRS) {
             renderHitMarker(event);
         }
+        if (event.type == RenderGameOverlayEvent.ElementType.TEXT) {
+            renderHitMarker(event);
+        }
     }
 
     /** 在 Post.ALL 阶段渲染伤害数字（确保在其他 GUI 元素之后绘制） */
@@ -126,18 +129,9 @@ public class HitMarkerRenderer {
 
         // ── 第一遍：边框 ──
         if (HitMarkerMod.config.enableBorder && HitMarkerMod.config.borderWidth > 0) {
-            float br, bg, bb;
-            if (isKill && (HitMarkerMod.config.killBorderColorR != 0 ||
-                           HitMarkerMod.config.killBorderColorG != 0 ||
-                           HitMarkerMod.config.killBorderColorB != 0)) {
-                br = HitMarkerMod.config.killBorderColorR / 255.0f;
-                bg = HitMarkerMod.config.killBorderColorG / 255.0f;
-                bb = HitMarkerMod.config.killBorderColorB / 255.0f;
-            } else {
-                br = HitMarkerMod.config.borderColorR / 255.0f;
-                bg = HitMarkerMod.config.borderColorG / 255.0f;
-                bb = HitMarkerMod.config.borderColorB / 255.0f;
-            }
+            float br = (isKill ? HitMarkerMod.config.killBorderColorR : HitMarkerMod.config.borderColorR) / 255.0f;
+            float bg = (isKill ? HitMarkerMod.config.killBorderColorG : HitMarkerMod.config.borderColorG) / 255.0f;
+            float bb = (isKill ? HitMarkerMod.config.killBorderColorB : HitMarkerMod.config.borderColorB) / 255.0f;
             GlStateManager.color(br, bg, bb, alpha);
             GL11.glLineWidth(thickness + HitMarkerMod.config.borderWidth * 2);
             drawLine(cx, cy, d, -d, gap, lineLen, taper, translateDist);
