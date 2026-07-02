@@ -50,17 +50,6 @@ public class HitMarkerConfig {
     public boolean enableKillBlood = true;
     public float killBloodIntensity = 0.5f;
 
-    // ── damage_numbers ──
-    public boolean enableDamageNumbers = true;
-    public int dmgNumColorR = 255;
-    public int dmgNumColorG = 255;
-    public int dmgNumColorB = 255;
-    public float dmgNumScale = 1.5f;
-    public int dmgNumDuration = 30;           // ticks
-    public float dmgNumFloatSpeed = 0.5f;     // 每 tick 上移像素
-    public int dmgNumXOffset = 0;
-    public int dmgNumYOffset = -20;            // 准星上方 20px
-
     // ── constructor ──
     public HitMarkerConfig(File configFile) {
         config = new Configuration(configFile);
@@ -216,49 +205,6 @@ public class HitMarkerConfig {
         p.comment = "Intensity of kill blood particles (0.0 - 1.0)";
         p.setMinValue(0.0).setMaxValue(1.0);
         killBloodIntensity = (float) p.getDouble();
-
-        // ── damage_numbers ──
-        p = config.get("damage_numbers", "enableDamageNumbers", true);
-        p.comment = "Show floating damage numbers on hit";
-        enableDamageNumbers = p.getBoolean();
-
-        p = config.get("damage_numbers", "dmgNumColorR", 255);
-        p.comment = "Damage number red (0-255)";
-        p.setMinValue(0).setMaxValue(255);
-        dmgNumColorR = p.getInt();
-
-        p = config.get("damage_numbers", "dmgNumColorG", 255);
-        p.comment = "Damage number green (0-255)";
-        p.setMinValue(0).setMaxValue(255);
-        dmgNumColorG = p.getInt();
-
-        p = config.get("damage_numbers", "dmgNumColorB", 255);
-        p.comment = "Damage number blue (0-255)";
-        p.setMinValue(0).setMaxValue(255);
-        dmgNumColorB = p.getInt();
-
-        p = config.get("damage_numbers", "dmgNumScale", 1.5f);
-        p.comment = "Damage number text scale (0.5 - 5.0)";
-        p.setMinValue(0.5).setMaxValue(5.0);
-        dmgNumScale = (float) p.getDouble();
-
-        p = config.get("damage_numbers", "dmgNumDuration", 30);
-        p.comment = "Damage number lifetime in ticks (5 - 100)";
-        p.setMinValue(5).setMaxValue(100);
-        dmgNumDuration = p.getInt();
-
-        p = config.get("damage_numbers", "dmgNumFloatSpeed", 0.5f);
-        p.comment = "Damage number upward float speed (0.0 - 5.0)";
-        p.setMinValue(0.0).setMaxValue(5.0);
-        dmgNumFloatSpeed = (float) p.getDouble();
-
-        p = config.get("damage_numbers", "dmgNumXOffset", 0);
-        p.comment = "Damage number X offset from center";
-        dmgNumXOffset = p.getInt();
-
-        p = config.get("damage_numbers", "dmgNumYOffset", -20);
-        p.comment = "Damage number Y offset from center (negative=up)";
-        dmgNumYOffset = p.getInt();
     }
 
     public void save() {

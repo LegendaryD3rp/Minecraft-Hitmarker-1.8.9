@@ -114,7 +114,6 @@ public class CommonEventHandler {
         entityHitTimestamps.put(targetId, System.currentTimeMillis());
 
         HitMarkerRenderer.showHitMarker();
-        if (event.ammount > 0.5F) HitMarkerRenderer.showDamageNumber(event.ammount);
         playRandomHitSound();
 
         // 粒子
@@ -264,7 +263,6 @@ public class CommonEventHandler {
                     if (shouldTriggerHitMarker(entry.getKey())) {
                         entityHitTimestamps.put(entry.getKey(), now);
                         HitMarkerRenderer.showHitMarker();
-                        HitMarkerRenderer.showDamageNumber(diff);
                         playRandomHitSound();
                         spawnHitParticlesAt(living.posX, living.posY + living.height / 2.0,
                                 living.posZ, 25, HitMarkerMod.config.hitBloodIntensity);

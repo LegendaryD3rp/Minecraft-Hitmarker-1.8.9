@@ -51,7 +51,6 @@ public class HitMarkerGuiConfig extends GuiConfig {
         elements.add(new BorderEntryElement(HitMarkerMod.config.config.getCategory("border")));
         elements.add(new VisualEntryElement(HitMarkerMod.config.config.getCategory("visual")));
         elements.add(new ConfigElement(HitMarkerMod.config.config.getCategory("effects")));
-        elements.add(new ConfigElement(HitMarkerMod.config.config.getCategory("damage_numbers")));
         elements.add(new ConfigElement(HitMarkerMod.config.config.getCategory(Configuration.CATEGORY_GENERAL)));
 
         return elements;
