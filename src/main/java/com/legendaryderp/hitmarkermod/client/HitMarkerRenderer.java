@@ -10,6 +10,8 @@ import net.minecraftforge.fml.relauncher.SideOnly;
 import com.legendaryderp.hitmarkermod.HitMarkerMod;
 import org.lwjgl.opengl.GL11;
 
+import java.util.Random;
+
 @SideOnly(Side.CLIENT)
 public class HitMarkerRenderer {
 
@@ -62,16 +64,16 @@ public class HitMarkerRenderer {
     private void renderNormalHitMarker(RenderGameOverlayEvent event, long elapsed) {
         ScaledResolution res = new ScaledResolution(Minecraft.getMinecraft());
         int cx = res.getScaledWidth() / 2, cy = res.getScaledHeight() / 2;
-        renderMarker(cx, cy, elapsed, DURATION, false);
+        renderMarker(cx, cy, elapsed, DURATION, false, hitMarkerTime);
     }
 
     private void renderKillMarker(RenderGameOverlayEvent event, long elapsed) {
         ScaledResolution res = new ScaledResolution(Minecraft.getMinecraft());
         int cx = res.getScaledWidth() / 2, cy = res.getScaledHeight() / 2;
-        renderMarker(cx, cy, elapsed, KILL_DURATION, true);
+        renderMarker(cx, cy, elapsed, KILL_DURATION, true, killMarkerTime);
     }
 
-    private void renderMarker(int cx, int cy, long elapsed, long duration, boolean isKill) {
+    private void renderMarker(int cx, int cy, long elapsed, long duration, boolean isKill, long startTime) {
         float lineLen = isKill ? HitMarkerMod.config.killSize : HitMarkerMod.config.hitSize;
         float thickness = lineLen * 0.35f;
         float gap = isKill ? lineLen * 0.35f : lineLen * 0.7f;
@@ -84,6 +86,16 @@ public class HitMarkerRenderer {
         float r = (isKill ? HitMarkerMod.config.killColorR : HitMarkerMod.config.hitColorR) / 255.0f;
         float g = (isKill ? HitMarkerMod.config.killColorG : HitMarkerMod.config.hitColorG) / 255.0f;
         float b = (isKill ? HitMarkerMod.config.killColorB : HitMarkerMod.config.hitColorB) / 255.0f;
+
+        // ── 随机旋转（同一次命中角度固定，不同次随机） ──
+        GlStateManager.pushMatrix();
+        GlStateManager.translate(cx, cy, 0.0F);
+        if (HitMarkerMod.config.enableRandomRotate && HitMarkerMod.config.randomRotateStrength > 0) {
+            Random rng = new Random(startTime);
+            float angle = (rng.nextFloat() * 2.0F - 1.0F) * HitMarkerMod.config.randomRotateStrength;
+            GlStateManager.rotate(angle, 0.0F, 0.0F, 1.0F);
+        }
+        GlStateManager.translate(-cx, -cy, 0.0F);
 
         // 用 GlStateManager 管理状态（避免 glPushAttrib 导致 GlStateManager 缓存不同步）
         GlStateManager.disableTexture2D();
@@ -120,6 +132,7 @@ public class HitMarkerRenderer {
         GlStateManager.disableBlend();
         GlStateManager.color(1.0F, 1.0F, 1.0F, 1.0F);
         GL11.glDisable(GL11.GL_LINE_SMOOTH);
+        GlStateManager.popMatrix();
     }
 
     private void drawLine(float cx, float cy, float dx, float dy, float gap, float len, float taper, float trans) {

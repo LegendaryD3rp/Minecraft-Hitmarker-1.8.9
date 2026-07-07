@@ -15,6 +15,8 @@ public class HitMarkerConfig {
     // ── general ──
     public boolean enableChatKillDetection = true;
     public boolean cancelDeathMessages = false;
+    public boolean enableRandomRotate = true;
+    public float randomRotateStrength = 360.0f;
 
     // ── audio ──
     public boolean enableHitSounds = true;
@@ -81,6 +83,15 @@ public class HitMarkerConfig {
         p = config.get(Configuration.CATEGORY_GENERAL, "cancelDeathMessages", false);
         p.comment = "Cancel vanilla death messages";
         cancelDeathMessages = p.getBoolean();
+
+        p = config.get(Configuration.CATEGORY_GENERAL, "enableRandomRotate", true);
+        p.comment = "Randomly rotate the hit/kill marker angle each time";
+        enableRandomRotate = p.getBoolean();
+
+        p = config.get(Configuration.CATEGORY_GENERAL, "randomRotateStrength", 360.0);
+        p.comment = "Maximum rotation offset in degrees (0-360)";
+        p.setMinValue(0.0).setMaxValue(360.0);
+        randomRotateStrength = (float) p.getDouble();
 
         // ── audio ──
         p = config.get("audio", "enableHitSounds", true);
