@@ -92,7 +92,7 @@ public class HitMarkerRenderer {
         GlStateManager.translate(cx, cy, 0.0F);
         if (HitMarkerMod.config.enableRandomRotate && HitMarkerMod.config.randomRotateStrength > 0) {
             Random rng = new Random(startTime);
-            float angle = (rng.nextFloat() * 2.0F - 1.0F) * HitMarkerMod.config.randomRotateStrength;
+            float angle = (rng.nextBoolean() ? 1.0F : -1.0F) * (5.0F + rng.nextFloat() * 15.0F);
             GlStateManager.rotate(angle, 0.0F, 0.0F, 1.0F);
         }
         GlStateManager.translate(-cx, -cy, 0.0F);
