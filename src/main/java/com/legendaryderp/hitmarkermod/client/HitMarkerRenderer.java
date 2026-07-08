@@ -24,7 +24,8 @@ public class HitMarkerRenderer {
 
     // 旋转角度：触发时定死，渲染时只读不重算
     private static float currentHitAngle = 0;
-    private static float lastHitAngle = Float.NaN;
+    // 极性交替开关：保证连续两次方向永远相反
+    private static boolean lastWasPositive = true;
 
     // ── 公共 API ──
     public static void showHitMarker() {
@@ -36,13 +37,9 @@ public class HitMarkerRenderer {
     private static float generateRotateAngle(long seed) {
         if (!HitMarkerMod.config.enableRandomRotate || HitMarkerMod.config.randomRotateStrength <= 0) return 0;
         Random rng = new Random(seed);
-        float angle = (rng.nextBoolean() ? 1.0F : -1.0F) * (5.0F + rng.nextFloat() * 10.0F);
-        if (angle == lastHitAngle) {
-            angle = -angle;
-            if (angle == 0.0F) angle = 5.0F;
-        }
-        lastHitAngle = angle;
-        return angle;
+        float magnitude = 5.0F + rng.nextFloat() * 10.0F; // 5~15°
+        lastWasPositive = !lastWasPositive;
+        return lastWasPositive ? magnitude : -magnitude;
     }
 
     public static void showKillMarker() {
