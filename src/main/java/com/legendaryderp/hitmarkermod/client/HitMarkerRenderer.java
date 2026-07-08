@@ -36,7 +36,7 @@ public class HitMarkerRenderer {
     private static float generateRotateAngle(long seed) {
         if (!HitMarkerMod.config.enableRandomRotate || HitMarkerMod.config.randomRotateStrength <= 0) return 0;
         Random rng = new Random(seed);
-        float angle = (rng.nextBoolean() ? 1.0F : -1.0F) * (5.0F + rng.nextFloat() * 15.0F);
+        float angle = (rng.nextBoolean() ? 1.0F : -1.0F) * (5.0F + rng.nextFloat() * 10.0F);
         if (angle == lastHitAngle) {
             angle = -angle;
             if (angle == 0.0F) angle = 5.0F;
